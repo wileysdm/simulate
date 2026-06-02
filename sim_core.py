@@ -256,6 +256,8 @@ class SimulationEngine:
         self._recent_fill_order: deque[str] = deque()
         self._hour_fill_buffers: DefaultDict[int, List[CanonicalTraderFill]] = defaultdict(list)
         self._hour_fill_buffer_ids: DefaultDict[int, set[str]] = defaultdict(set)
+        self._hour_fill_min_ts: Dict[int, int] = {}
+        self._hour_fill_max_ts: Dict[int, int] = {}
         self._raw_header_written: Dict[Path, bool] = {}
         self._log_file_ready = False
 
@@ -327,6 +329,7 @@ class SimulationEngine:
         startup_day = utc_day_text(now_ts)
         startup_next_day_ts = utc_midnight_ts(startup_day) + 86400
         backfill_start_ts = utc_midnight_ts(startup_day) - int(self.config.backfill_days) * 86400
+        required_hours_end_ts = int(now_ts)
         replayed_until_ts = self._restore_persisted_window(start_ts=int(backfill_start_ts), end_ts=int(now_ts))
         startup_block = self._retry_network_call(
             "bootstrap latest block",
@@ -343,6 +346,33 @@ class SimulationEngine:
         resume_start_ts = int(backfill_start_ts)
         if replayed_until_ts is not None:
             resume_start_ts = max(int(backfill_start_ts), int(replayed_until_ts) + 1)
+
+        missing_hour_start_ts = self._first_missing_hour_start(
+            start_ts=int(backfill_start_ts),
+            end_ts=int(required_hours_end_ts),
+        )
+        if missing_hour_start_ts is not None:
+            resume_start_ts = min(int(resume_start_ts), int(missing_hour_start_ts))
+            self.log(
+                "coverage gap detected: "
+                f"required_window={utc_day_text(backfill_start_ts)}..{utc_day_text(required_hours_end_ts - 1)} "
+                f"first_missing_hour_ts={missing_hour_start_ts}"
+            )
+        else:
+            self.log(
+                "coverage check ok: "
+                f"required_window={utc_day_text(backfill_start_ts)}..{utc_day_text(required_hours_end_ts - 1)} "
+                f"hours={int(self.config.backfill_days) * 24}"
+            )
+
+        current_hour_start_ts = self._hour_start_ts(int(now_ts))
+        current_hour_backfill_scheduled = int(resume_start_ts) <= int(current_hour_start_ts)
+        self.log(
+            "current-hour backfill plan: "
+            f"hour_start_ts={current_hour_start_ts} now_ts={now_ts} "
+            f"scheduled={str(current_hour_backfill_scheduled).lower()} "
+            f"resume_start_ts={resume_start_ts}"
+        )
 
         if resume_start_ts <= int(now_ts):
             self._start_worker(
@@ -489,6 +519,25 @@ class SimulationEngine:
         except Exception:
             return None
 
+    def _first_missing_hour_start(self, *, start_ts: int, end_ts: int) -> Optional[int]:
+        if int(end_ts) <= int(start_ts):
+            return None
+        present_hour_starts: set[int] = set()
+        for path in sorted(self.config.raw_dir.glob("*/*.csv")):
+            parsed = self._parse_raw_hour_path(path)
+            if parsed is None:
+                continue
+            hour_start_ts, _ = parsed
+            if int(hour_start_ts) < int(start_ts) or int(hour_start_ts) >= int(end_ts):
+                continue
+            present_hour_starts.add(int(hour_start_ts))
+        cursor = int(start_ts) - (int(start_ts) % 3600)
+        while cursor < int(end_ts):
+            if int(cursor) not in present_hour_starts:
+                return int(cursor)
+            cursor += 3600
+        return None
+
     def _display_path(self, path: Path) -> str:
         for root in (self.config.raw_dir, self.config.output_dir):
             try:
@@ -514,23 +563,26 @@ class SimulationEngine:
         if dedupe_key in keys:
             return
         keys.add(dedupe_key)
+        ts = int(fill.timestamp)
+        prev_min = self._hour_fill_min_ts.get(int(hour_start_ts))
+        prev_max = self._hour_fill_max_ts.get(int(hour_start_ts))
+        self._hour_fill_min_ts[int(hour_start_ts)] = ts if prev_min is None else min(int(prev_min), ts)
+        self._hour_fill_max_ts[int(hour_start_ts)] = ts if prev_max is None else max(int(prev_max), ts)
         self._hour_fill_buffers[int(hour_start_ts)].append(fill)
+
+    @staticmethod
+    def _hour_buffer_is_complete(*, hour_start_ts: int, min_ts: Optional[int], max_ts: Optional[int]) -> bool:
+        if min_ts is None or max_ts is None:
+            return False
+        # Treat an hour as complete only when data reaches close to both hour boundaries.
+        return int(min_ts) <= int(hour_start_ts) + 60 and int(max_ts) >= int(hour_start_ts) + 3599 - 60
 
     def _store_fills(self, fills: Sequence[CanonicalTraderFill], *, now_ts: int) -> None:
         if not fills:
             return
-        current_hour_start_ts = self._current_hour_start_ts(int(now_ts))
-        closed_by_hour: DefaultDict[int, List[CanonicalTraderFill]] = defaultdict(list)
         for fill in fills:
             hour_start_ts = self._hour_start_ts(int(fill.timestamp))
-            if int(hour_start_ts) < int(current_hour_start_ts):
-                closed_by_hour[int(hour_start_ts)].append(fill)
-            else:
-                self._buffer_fill_for_hour(int(hour_start_ts), fill)
-        for hour_start_ts, group in sorted(closed_by_hour.items(), key=lambda item: item[0]):
-            path = self._raw_hour_path_from_hour_start(int(hour_start_ts))
-            ordered = sorted(group, key=lambda item: (item.block_number, item.tx, item.log_index, item.trader))
-            self._write_fill_rows(path, ordered, append=True)
+            self._buffer_fill_for_hour(int(hour_start_ts), fill)
 
     def _flush_closed_hour_buffers(self, *, now_ts: int) -> None:
         current_hour_start_ts = self._current_hour_start_ts(int(now_ts))
@@ -538,10 +590,25 @@ class SimulationEngine:
             [hour_start_ts for hour_start_ts in self._hour_fill_buffers.keys() if int(hour_start_ts) < int(current_hour_start_ts)]
         )
         for hour_start_ts in ready_hours:
-            fills = self._hour_fill_buffers.pop(int(hour_start_ts), [])
-            self._hour_fill_buffer_ids.pop(int(hour_start_ts), None)
+            fills = self._hour_fill_buffers.get(int(hour_start_ts), [])
             if not fills:
+                self._hour_fill_buffers.pop(int(hour_start_ts), None)
+                self._hour_fill_buffer_ids.pop(int(hour_start_ts), None)
+                self._hour_fill_min_ts.pop(int(hour_start_ts), None)
+                self._hour_fill_max_ts.pop(int(hour_start_ts), None)
                 continue
+            min_ts = self._hour_fill_min_ts.get(int(hour_start_ts))
+            max_ts = self._hour_fill_max_ts.get(int(hour_start_ts))
+            if not self._hour_buffer_is_complete(
+                hour_start_ts=int(hour_start_ts),
+                min_ts=min_ts,
+                max_ts=max_ts,
+            ):
+                continue
+            self._hour_fill_buffers.pop(int(hour_start_ts), None)
+            self._hour_fill_buffer_ids.pop(int(hour_start_ts), None)
+            self._hour_fill_min_ts.pop(int(hour_start_ts), None)
+            self._hour_fill_max_ts.pop(int(hour_start_ts), None)
             path = self._raw_hour_path_from_hour_start(int(hour_start_ts))
             ordered = sorted(fills, key=lambda item: (item.block_number, item.tx, item.log_index, item.trader))
             self._write_fill_rows(path, ordered, append=True)
@@ -804,6 +871,7 @@ class SimulationEngine:
             urls=list(urls),
             timeout=30,
             retries=8,
+            wallclock_timeout=float(fetch_constants.RPC_WALLCLOCK_RETRY_SEC),
         )
         return int(str(latest_hex), 16)
 

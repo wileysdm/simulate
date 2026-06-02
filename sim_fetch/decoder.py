@@ -59,7 +59,7 @@ def decode_orderfilled(log: dict, *, block_timestamp: Optional[int] = None) -> O
             urls=constants.LOGS_RPC_URLS,
             timeout=int(constants.PREFETCH_RPC_TIMEOUT_SEC),
             retries=1,
-            wallclock_timeout=float(constants.PREFETCH_RPC_TIMEOUT_SEC),
+            wallclock_timeout=float(constants.RPC_WALLCLOCK_RETRY_SEC),
         )
     )
     tx = log.get("transactionHash")

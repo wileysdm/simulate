@@ -176,7 +176,14 @@ def _latest_block_and_ts(
     primary_ts_urls = list(ts_urls or constants.TS_RPC_URLS)
     secondary_log_urls = list(fallback_log_urls or constants.LOGS_RPC_URLS[:3])
     latest_urls = list(dict.fromkeys(primary_ts_urls + secondary_log_urls))
-    bn_hex = rpc("eth_blockNumber", [], urls=latest_urls, timeout=30, retries=8)
+    bn_hex = rpc(
+        "eth_blockNumber",
+        [],
+        urls=latest_urls,
+        timeout=30,
+        retries=8,
+        wallclock_timeout=float(constants.RPC_WALLCLOCK_RETRY_SEC),
+    )
     bn = int(bn_hex, 16)
     ts = block_ts_multi_provider(bn, urls=primary_ts_urls)
     return bn, ts
@@ -278,7 +285,8 @@ def fetch_logs(
 ) -> None:
     addrs = [Web3.to_checksum_address(a) for a in addresses]
 
-    LOGS_RPC_CALL_TIMEOUT_SEC = 30
+    LOGS_RPC_CALL_TIMEOUT_SEC = int(constants.LOGS_RPC_CALL_TIMEOUT_SEC)
+    LOGS_RPC_WALLCLOCK_TIMEOUT_SEC = float(constants.RPC_WALLCLOCK_RETRY_SEC)
     LOGS_RPC_SLOW_SECONDS = 10
     LOGS_RPC_BAN_SECONDS = 10 * 60
     HEARTBEAT_SECONDS = 60.0
@@ -387,6 +395,7 @@ def fetch_logs(
                     urls=[url],
                     timeout=int(LOGS_RPC_CALL_TIMEOUT_SEC),
                     retries=1,
+                    wallclock_timeout=float(LOGS_RPC_WALLCLOCK_TIMEOUT_SEC),
                 )
                 if not isinstance(logs, (list, dict)):
                     ban_until = time.time() + float(LOGS_RPC_BAN_SECONDS)

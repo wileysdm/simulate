@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 
 from simulate.sim_fetch import constants as fetch_constants
 
-RUNTIME_BASE_DIR = Path("/data/deming/simulate/runtime")
+WORKSPACE_RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+DATA_RUNTIME_DIR = Path.home() / ".local" / "share" / "simulate" / "runtime"
 
 
 @dataclass(frozen=True)
@@ -51,13 +52,13 @@ class RuntimeConfig:
     )
     history_ts_rpc_urls: Optional[Tuple[str, ...]] = None
     live_ts_rpc_urls: Optional[Tuple[str, ...]] = None
-    output_dir: Path = field(default_factory=lambda: RUNTIME_BASE_DIR)
+    output_dir: Path = field(default_factory=lambda: DATA_RUNTIME_DIR)
     log_path: Path = field(
-        default_factory=lambda: RUNTIME_BASE_DIR / "logs" / "simulate.log"
+        default_factory=lambda: WORKSPACE_RUNTIME_DIR / "logs" / "simulate.log"
     )
-    raw_dir: Path = field(default_factory=lambda: RUNTIME_BASE_DIR / "raw")
+    raw_dir: Path = field(default_factory=lambda: DATA_RUNTIME_DIR / "raw")
     trades_csv: Path = field(
-        default_factory=lambda: RUNTIME_BASE_DIR / "simulated_trades.csv"
+        default_factory=lambda: DATA_RUNTIME_DIR / "simulated_trades.csv"
     )
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
 
