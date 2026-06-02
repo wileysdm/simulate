@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 
 from simulate.sim_fetch import constants as fetch_constants
 
+RUNTIME_BASE_DIR = Path("/data/deming/simulate/runtime")
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -24,7 +26,7 @@ class RuntimeConfig:
     clob_base_url: str = "https://clob.polymarket.com"
     price_timeout_seconds: int = 15
     backfill_days: int = 7
-    history_chunk_seconds: int = 3 * 3600
+    history_chunk_seconds: int = 24 * 3600
     live_poll_interval_seconds: int = 10
     live_fetch_block_span: int = 10
     ingest_queue_max_batches: int = 8
@@ -49,18 +51,13 @@ class RuntimeConfig:
     )
     history_ts_rpc_urls: Optional[Tuple[str, ...]] = None
     live_ts_rpc_urls: Optional[Tuple[str, ...]] = None
-    output_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "runtime")
+    output_dir: Path = field(default_factory=lambda: RUNTIME_BASE_DIR)
     log_path: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent / "runtime" / "logs" / "simulate.log"
+        default_factory=lambda: RUNTIME_BASE_DIR / "logs" / "simulate.log"
     )
-    raw_history_dir: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent / "runtime" / "raw_history"
-    )
-    raw_live_dir: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent / "runtime" / "raw_live"
-    )
+    raw_dir: Path = field(default_factory=lambda: RUNTIME_BASE_DIR / "raw")
     trades_csv: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent / "runtime" / "simulated_trades.csv"
+        default_factory=lambda: RUNTIME_BASE_DIR / "simulated_trades.csv"
     )
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
 

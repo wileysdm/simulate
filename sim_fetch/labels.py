@@ -12,6 +12,7 @@ from web3 import Web3
 from . import constants
 from . import decoder
 from . import rpc
+from . import resilient
 
 _SESSION = requests.Session()
 _GAMMA_MARKET_CACHE: Dict[str, Dict[str, List[str]]] = {}
@@ -54,9 +55,15 @@ def gamma_markets_by_condition_ids(cond_ids: List[str], *, batch: int = 20, time
         while True:
             query = [(k, v) for (k, v) in params if k != "offset"]
             query.append(("offset", str(offset)))
-            response = _SESSION.get(constants.GAMMA_MARKETS, params=query, timeout=timeout)
-            response.raise_for_status()
-            markets = response.json()
+            markets = resilient.request_json(
+                session=_SESSION,
+                method="GET",
+                url=constants.GAMMA_MARKETS,
+                params=query,
+                timeout=float(timeout),
+                attempts=4,
+                context=f"gamma condition_ids chunk={len(chunk)} offset={offset}",
+            )
             if isinstance(markets, dict):
                 markets = markets.get("data") or markets.get("markets") or []
             if not isinstance(markets, list) or not markets:

@@ -14,7 +14,7 @@ from statistics import median
 from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from simulate.sim_fetch import constants as fetch_constants
-from simulate.sim_fetch import decoder, gamma, labels, rpc
+from simulate.sim_fetch import decoder, gamma, labels, resilient, rpc
 
 from simulate.sim_config import RuntimeConfig
 from simulate.sim_price import PolymarketPriceClient
@@ -252,14 +252,15 @@ class SimulationEngine:
         self._live_worker_done = False
         self._minimum_trading_enabled_ts: Optional[int] = None
         self._startup_block: Optional[int] = None
-        self._recent_actor_fill_ids: set[str] = set()
-        self._recent_actor_fill_order: deque[str] = deque()
+        self._recent_fill_ids: set[str] = set()
+        self._recent_fill_order: deque[str] = deque()
+        self._hour_fill_buffers: DefaultDict[int, List[CanonicalTraderFill]] = defaultdict(list)
+        self._hour_fill_buffer_ids: DefaultDict[int, set[str]] = defaultdict(set)
         self._raw_header_written: Dict[Path, bool] = {}
         self._log_file_ready = False
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        self.config.raw_history_dir.mkdir(parents=True, exist_ok=True)
-        self.config.raw_live_dir.mkdir(parents=True, exist_ok=True)
+        self.config.raw_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._trades_header_written = self.config.trades_csv.exists() and self.config.trades_csv.stat().st_size > 0
 
@@ -272,6 +273,21 @@ class SimulationEngine:
             fh.write(f"{timestamp}Z {line}\n")
         self._log_file_ready = True
 
+    def _log_network_retry(self, label: str, exc: BaseException, attempt: int, total: int, sleep_seconds: float) -> None:
+        self.log(
+            f"{label} retry attempt={attempt}/{total} sleep={sleep_seconds:.2f}s "
+            f"err={resilient.describe_exception(exc)}"
+        )
+
+    def _retry_network_call(self, label: str, func, *, attempts: int = 4):
+        return resilient.retry_call(
+            func,
+            attempts=int(attempts),
+            on_retry=lambda exc, attempt, total, sleep: self._log_network_retry(
+                label, exc, attempt, total, sleep
+            ),
+        )
+
     def run(self, *, max_polls: int = 0) -> None:
         self.bootstrap(max_polls=max_polls)
         try:
@@ -280,6 +296,7 @@ class SimulationEngine:
                 now_ts = int(time.time())
                 self._process_due_actions(now_ts)
                 self._close_near_resolved_positions(now_ts)
+                self._flush_closed_hour_buffers(now_ts=now_ts)
                 if int(max_polls) > 0 and self._live_worker_done and self._backfill_drained and self._queues_empty():
                     break
                 if not worked:
@@ -289,6 +306,7 @@ class SimulationEngine:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._flush_closed_hour_buffers(now_ts=int(time.time()))
         for worker in self._workers:
             worker.join(timeout=0.5)
 
@@ -310,7 +328,11 @@ class SimulationEngine:
         startup_next_day_ts = utc_midnight_ts(startup_day) + 86400
         backfill_start_ts = utc_midnight_ts(startup_day) - int(self.config.backfill_days) * 86400
         replayed_until_ts = self._restore_persisted_window(start_ts=int(backfill_start_ts), end_ts=int(now_ts))
-        startup_block = self._latest_block_number(use_live=True)
+        startup_block = self._retry_network_call(
+            "bootstrap latest block",
+            lambda: self._latest_block_number(use_live=True),
+            attempts=6,
+        )
 
         self._startup_block = int(startup_block)
         self._minimum_trading_enabled_ts = int(startup_next_day_ts)
@@ -418,25 +440,16 @@ class SimulationEngine:
         descriptors: List[Tuple[int, Path]] = []
         seen_paths: set[Path] = set()
 
-        for path in sorted(self.config.raw_history_dir.glob("history_*.csv")):
-            parsed = self._parse_history_chunk_name(path)
+        for path in sorted(self.config.raw_dir.glob("*/*.csv")):
+            parsed = self._parse_raw_hour_path(path)
             if parsed is None:
                 continue
-            chunk_start, chunk_end = parsed
-            if int(chunk_end) < int(start_ts) or int(chunk_start) > int(end_ts):
+            hour_start_ts, hour_end_ts = parsed
+            if int(hour_end_ts) < int(start_ts) or int(hour_start_ts) > int(end_ts):
                 continue
             if path not in seen_paths:
-                descriptors.append((int(chunk_start), path))
+                descriptors.append((int(hour_start_ts), path))
                 seen_paths.add(path)
-
-        current_day = date.fromisoformat(utc_day_text(start_ts))
-        end_day = date.fromisoformat(utc_day_text(end_ts))
-        while current_day <= end_day:
-            path = self.config.raw_live_dir / f"{current_day.isoformat()}.csv"
-            if path.exists() and path not in seen_paths:
-                descriptors.append((utc_midnight_ts(current_day.isoformat()), path))
-                seen_paths.add(path)
-            current_day = current_day + timedelta(days=1)
 
         if not descriptors:
             return None
@@ -458,22 +471,80 @@ class SimulationEngine:
                 loaded += 1
             if loaded > 0:
                 replayed_rows += int(loaded)
-                self.log(f"replay file={path.name} rows={loaded}")
+                self.log(f"replay file={self._display_path(path)} rows={loaded}")
 
         if replayed_rows == 0:
             return None
         self.log(f"replay complete rows={replayed_rows} latest_ts={latest_ts}")
         return latest_ts
 
-    def _parse_history_chunk_name(self, path: Path) -> Optional[Tuple[int, int]]:
-        stem = path.stem
-        parts = stem.split("_")
-        if len(parts) < 6 or parts[0] != "history":
-            return None
+    def _parse_raw_hour_path(self, path: Path) -> Optional[Tuple[int, int]]:
         try:
-            return int(parts[1]), int(parts[2])
-        except ValueError:
+            trade_day = path.parent.name
+            hour = int(path.stem)
+            if hour < 0 or hour > 23:
+                return None
+            start_ts = utc_midnight_ts(trade_day) + hour * 3600
+            return int(start_ts), int(start_ts + 3599)
+        except Exception:
             return None
+
+    def _display_path(self, path: Path) -> str:
+        for root in (self.config.raw_dir, self.config.output_dir):
+            try:
+                return str(path.relative_to(root))
+            except ValueError:
+                continue
+        return str(path)
+
+    @staticmethod
+    def _hour_start_ts(timestamp: int) -> int:
+        return int(timestamp) - (int(timestamp) % 3600)
+
+    def _current_hour_start_ts(self, now_ts: int) -> int:
+        return self._hour_start_ts(int(now_ts))
+
+    def _raw_hour_path_from_hour_start(self, hour_start_ts: int) -> Path:
+        dt = datetime.fromtimestamp(int(hour_start_ts), tz=timezone.utc)
+        return self.config.raw_dir / dt.strftime("%Y-%m-%d") / f"{dt.strftime('%H')}.csv"
+
+    def _buffer_fill_for_hour(self, hour_start_ts: int, fill: CanonicalTraderFill) -> None:
+        dedupe_key = f"{fill.raw_fill_id}:{fill.trader}"
+        keys = self._hour_fill_buffer_ids[int(hour_start_ts)]
+        if dedupe_key in keys:
+            return
+        keys.add(dedupe_key)
+        self._hour_fill_buffers[int(hour_start_ts)].append(fill)
+
+    def _store_fills(self, fills: Sequence[CanonicalTraderFill], *, now_ts: int) -> None:
+        if not fills:
+            return
+        current_hour_start_ts = self._current_hour_start_ts(int(now_ts))
+        closed_by_hour: DefaultDict[int, List[CanonicalTraderFill]] = defaultdict(list)
+        for fill in fills:
+            hour_start_ts = self._hour_start_ts(int(fill.timestamp))
+            if int(hour_start_ts) < int(current_hour_start_ts):
+                closed_by_hour[int(hour_start_ts)].append(fill)
+            else:
+                self._buffer_fill_for_hour(int(hour_start_ts), fill)
+        for hour_start_ts, group in sorted(closed_by_hour.items(), key=lambda item: item[0]):
+            path = self._raw_hour_path_from_hour_start(int(hour_start_ts))
+            ordered = sorted(group, key=lambda item: (item.block_number, item.tx, item.log_index, item.trader))
+            self._write_fill_rows(path, ordered, append=True)
+
+    def _flush_closed_hour_buffers(self, *, now_ts: int) -> None:
+        current_hour_start_ts = self._current_hour_start_ts(int(now_ts))
+        ready_hours = sorted(
+            [hour_start_ts for hour_start_ts in self._hour_fill_buffers.keys() if int(hour_start_ts) < int(current_hour_start_ts)]
+        )
+        for hour_start_ts in ready_hours:
+            fills = self._hour_fill_buffers.pop(int(hour_start_ts), [])
+            self._hour_fill_buffer_ids.pop(int(hour_start_ts), None)
+            if not fills:
+                continue
+            path = self._raw_hour_path_from_hour_start(int(hour_start_ts))
+            ordered = sorted(fills, key=lambda item: (item.block_number, item.tx, item.log_index, item.trader))
+            self._write_fill_rows(path, ordered, append=True)
 
     def _iter_fill_file(self, path: Path):
         with path.open(newline="", encoding="utf-8") as fh:
@@ -510,45 +581,31 @@ class SimulationEngine:
 
     def _process_ingest_batch(self, batch: IngestBatch) -> None:
         fills: Sequence[CanonicalTraderFill] = batch.fills
-        if batch.live:
-            fills = self._dedupe_live_fills(fills)
+        fills = self._dedupe_batch_fills(fills)
         if not fills:
             return
-        self._persist_batch(batch, fills)
+        now_ts = int(time.time())
         for fill in fills:
             if self.trading_enabled_ts is not None:
                 self._ensure_trade_day(fill.trade_day)
             self._ingest_fill(fill, live=batch.live)
+        self._store_fills(fills, now_ts=now_ts)
+        self._flush_closed_hour_buffers(now_ts=now_ts)
 
-    def _dedupe_live_fills(self, fills: Sequence[CanonicalTraderFill]) -> List[CanonicalTraderFill]:
+    def _dedupe_batch_fills(self, fills: Sequence[CanonicalTraderFill]) -> List[CanonicalTraderFill]:
         out: List[CanonicalTraderFill] = []
         max_ids = max(10_000, int(self.config.recent_dedupe_max_ids))
         for fill in fills:
             dedupe_key = f"{fill.raw_fill_id}:{fill.trader}"
-            if dedupe_key in self._recent_actor_fill_ids:
+            if dedupe_key in self._recent_fill_ids:
                 continue
-            self._recent_actor_fill_ids.add(dedupe_key)
-            self._recent_actor_fill_order.append(dedupe_key)
+            self._recent_fill_ids.add(dedupe_key)
+            self._recent_fill_order.append(dedupe_key)
             out.append(fill)
-            while len(self._recent_actor_fill_order) > max_ids:
-                stale = self._recent_actor_fill_order.popleft()
-                self._recent_actor_fill_ids.discard(stale)
+            while len(self._recent_fill_order) > max_ids:
+                stale = self._recent_fill_order.popleft()
+                self._recent_fill_ids.discard(stale)
         return out
-
-    def _persist_batch(self, batch: IngestBatch, fills: Sequence[CanonicalTraderFill]) -> None:
-        if not fills:
-            return
-        if batch.source == "history":
-            path = self.config.raw_history_dir / f"{batch.batch_name}.csv"
-            self._write_fill_rows(path, fills, append=False)
-            return
-
-        fills_by_day: DefaultDict[str, List[CanonicalTraderFill]] = defaultdict(list)
-        for fill in fills:
-            fills_by_day[fill.trade_day].append(fill)
-        for trade_day, group in fills_by_day.items():
-            path = self.config.raw_live_dir / f"{trade_day}.csv"
-            self._write_fill_rows(path, group, append=True)
 
     def _write_fill_rows(self, path: Path, fills: Sequence[CanonicalTraderFill], *, append: bool) -> None:
         if not fills:
@@ -578,12 +635,24 @@ class SimulationEngine:
         chunk_block_span = max(1, int(math.ceil(float(chunk_seconds) * float(fetch_constants.BLOCKS_PER_SEC_EST))))
         history_ts_urls = self._history_ts_urls()
         history_logs_urls = self._history_logs_urls()
-        start_block, _ = rpc.blocks_for_time_range(
-            int(start_ts),
-            int(start_ts),
-            ts_urls=list(history_ts_urls),
-            fallback_log_urls=list(history_logs_urls[:3]),
-        )
+        while not self._stop_event.is_set():
+            try:
+                start_block, _ = self._retry_network_call(
+                    "history start block",
+                    lambda: rpc.blocks_for_time_range(
+                        int(start_ts),
+                        int(start_ts),
+                        ts_urls=list(history_ts_urls),
+                        fallback_log_urls=list(history_logs_urls[:3]),
+                    ),
+                    attempts=4,
+                )
+                break
+            except Exception as exc:
+                self.log(f"history start block deferred err={resilient.describe_exception(exc)}")
+                time.sleep(5.0)
+        else:
+            return
         chunk_lo = int(start_block)
         final_block = int(end_block)
         while chunk_lo <= final_block and not self._stop_event.is_set():
@@ -619,14 +688,26 @@ class SimulationEngine:
                     ),
                 )
 
-            self._stream_actor_batches(
-                int(chunk_lo),
-                int(chunk_hi),
-                fetch_urls=list(history_logs_urls),
-                block_ts_urls=list(dict.fromkeys(list(history_ts_urls) + list(history_logs_urls[:3]))),
-                on_fills=on_fills,
-                step_blocks=int(self.config.history_fetch_step_blocks),
-            )
+            try:
+                self._retry_network_call(
+                    f"history chunk {chunk_lo}->{chunk_hi}",
+                    lambda: self._stream_actor_batches(
+                        int(chunk_lo),
+                        int(chunk_hi),
+                        fetch_urls=list(history_logs_urls),
+                        block_ts_urls=list(dict.fromkeys(list(history_ts_urls) + list(history_logs_urls[:3]))),
+                        on_fills=on_fills,
+                        step_blocks=int(self.config.history_fetch_step_blocks),
+                    ),
+                    attempts=3,
+                )
+            except Exception as exc:
+                self.log(
+                    f"history chunk retry deferred blocks={chunk_lo}->{chunk_hi} "
+                    f"err={resilient.describe_exception(exc)}"
+                )
+                time.sleep(5.0)
+                continue
             chunk_lo = int(chunk_hi) + 1
 
         self._queue_put(
@@ -643,7 +724,16 @@ class SimulationEngine:
         live_ts_urls = self._live_ts_urls()
 
         while not self._stop_event.is_set():
-            latest_block = self._latest_block_number(use_live=True)
+            try:
+                latest_block = self._retry_network_call(
+                    "live latest block",
+                    lambda: self._latest_block_number(use_live=True),
+                    attempts=4,
+                )
+            except Exception as exc:
+                self.log(f"live latest block deferred err={resilient.describe_exception(exc)}")
+                time.sleep(max(2.0, float(self.config.live_poll_interval_seconds)))
+                continue
             if latest_block >= min_live_block and latest_block > cursor:
                 if int(latest_block) - int(cursor) > int(span):
                     from_block = max(min_live_block, int(cursor) + 1)
@@ -674,14 +764,26 @@ class SimulationEngine:
                         ),
                     )
 
-                self._stream_actor_batches(
-                    int(from_block),
-                    int(to_block),
-                    fetch_urls=list(live_logs_urls),
-                    block_ts_urls=list(dict.fromkeys(list(live_ts_urls) + list(live_logs_urls[:3]))),
-                    on_fills=on_fills,
-                    step_blocks=int(self.config.fetch_step_blocks),
-                )
+                try:
+                    self._retry_network_call(
+                        f"live tail {from_block}->{to_block}",
+                        lambda: self._stream_actor_batches(
+                            int(from_block),
+                            int(to_block),
+                            fetch_urls=list(live_logs_urls),
+                            block_ts_urls=list(dict.fromkeys(list(live_ts_urls) + list(live_logs_urls[:3]))),
+                            on_fills=on_fills,
+                            step_blocks=int(self.config.fetch_step_blocks),
+                        ),
+                        attempts=3,
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"live tail deferred blocks={from_block}->{to_block} "
+                        f"err={resilient.describe_exception(exc)}"
+                    )
+                    time.sleep(max(2.0, float(self.config.live_poll_interval_seconds)))
+                    continue
                 cursor = int(to_block)
 
             polls += 1

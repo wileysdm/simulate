@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import requests
 
 from . import constants
+from . import resilient
 
 _SESSION = requests.Session()
 
@@ -38,29 +39,15 @@ def gamma_markets_by_token_ids(token_ids: List[str], *, batch: int = 20) -> Dict
         while True:
             query = [(k, v) for (k, v) in params if k != "offset"]
             query.append(("offset", str(offset)))
-            markets = None
-            for attempt in range(4):
-                response = _SESSION.get(constants.GAMMA_MARKETS, params=query, timeout=30)
-                if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                    time.sleep(0.35 * (attempt + 1))
-                    continue
-                if response.status_code >= 400:
-                    body = (response.text or "").replace("\n", " ").strip()
-                    if len(body) > 220:
-                        body = body[:220] + "..."
-                    raise RuntimeError(
-                        f"Gamma markets HTTP {response.status_code}: chunk={len(chunk)} offset={offset} body={body}"
-                    )
-                try:
-                    markets = response.json()
-                except ValueError as exc:
-                    body = (response.text or "").replace("\n", " ").strip()
-                    if len(body) > 220:
-                        body = body[:220] + "..."
-                    raise RuntimeError(
-                        f"Gamma markets non-JSON response: chunk={len(chunk)} offset={offset} body={body}"
-                    ) from exc
-                break
+            markets = resilient.request_json(
+                session=_SESSION,
+                method="GET",
+                url=constants.GAMMA_MARKETS,
+                params=query,
+                timeout=30,
+                attempts=4,
+                context=f"gamma token_ids chunk={len(chunk)} offset={offset}",
+            )
 
             if isinstance(markets, dict):
                 markets = markets.get("data") or markets.get("markets") or []

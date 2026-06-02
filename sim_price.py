@@ -6,6 +6,10 @@ from typing import Dict, Optional
 
 import requests
 
+from simulate.sim_fetch import resilient
+
+_SESSION = requests.Session()
+
 
 @dataclass(frozen=True)
 class PriceSnapshot:
@@ -35,13 +39,20 @@ class PolymarketPriceClient:
         return fv
 
     def _get_json(self, path: str, *, params: Optional[dict] = None) -> object:
-        response = requests.get(
-            f"{self.base_url}{path}",
+        return resilient.request_json(
+            session=_SESSION,
+            method="GET",
+            url=f"{self.base_url}{path}",
             params=params,
-            timeout=self.timeout_seconds,
+            timeout=float(self.timeout_seconds),
+            attempts=4,
+            context=f"price {path}",
+            on_retry=lambda exc, attempt, total, sleep: print(
+                f"[simulate] price retry path={path} attempt={attempt}/{total} "
+                f"sleep={sleep:.2f}s err={resilient.describe_exception(exc)}",
+                flush=True,
+            ),
         )
-        response.raise_for_status()
-        return response.json()
 
     def _extract_book_price(self, payload: object, *, want_buy: bool) -> Optional[float]:
         if not isinstance(payload, dict):
